@@ -1,38 +1,123 @@
+#include <stdlib.h>
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
 #include "rados/librados.h"
 #include "rbd/librbd.h"
 
+// Move 8 objects at a time
+#define MOVE_BY 8
+
 struct rbd_move_data
 {
     rbd_image_t src;
     rbd_image_t dst;
+    int read_batch;
+    uint64_t read_offset[MOVE_BY];
+    size_t read_len[MOVE_BY];
+    void *buffers[MOVE_BY];
+    size_t buffer_size[MOVE_BY];
 };
 
-int move_extent(uint64_t offset, size_t len, const char *buf, void* data_ptr)
+int move_extent_apply(struct rbd_move_data *data)
 {
-    struct rbd_move_data* data = (struct rbd_move_data*)data_ptr;
-    if (buf != NULL)
+    if (data->read_batch > 0)
     {
-        int err;
-        err = rbd_write2(data->dst, offset, len, buf, LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL);
-        if (err < 0)
-            return err;
-        err = rbd_discard(data->src, offset, len);
-        if (err < 0)
-            return err;
+        rbd_completion_t comp[MOVE_BY];
+        int i, err;
+        for (i = 0; i < data->read_batch; i++)
+        {
+            if (data->buffer_size[i] < data->read_len[i])
+            {
+                data->buffers[i] = realloc(data->buffers[i], data->read_len[i]);
+                data->buffer_size[i] = data->read_len[i];
+            }
+            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
+            if (err < 0)
+                return err;
+            err = rbd_aio_read(data->src, data->read_offset[i], data->read_len[i], data->buffers[i], comp[i]);
+            if (err < 0)
+                return err;
+        }
+        for (i = 0; i < data->read_batch; i++)
+        {
+            err = rbd_aio_wait_for_complete(comp[i]);
+            if (err < 0)
+                return err;
+            rbd_aio_release(comp[i]);
+            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
+            if (err < 0)
+                return err;
+            err = rbd_aio_write(data->dst, data->read_offset[i], data->read_len[i], data->buffers[i], comp[i]);
+            if (err < 0)
+                return err;
+        }
+        for (i = 0; i < data->read_batch; i++)
+        {
+            err = rbd_aio_wait_for_complete(comp[i]);
+            if (err < 0)
+                return err;
+            rbd_aio_release(comp[i]);
+            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
+            if (err < 0)
+                return err;
+            err = rbd_aio_discard(data->src, data->read_offset[i], data->read_len[i], comp[i]);
+            if (err < 0)
+                return err;
+        }
+        for (i = 0; i < data->read_batch; i++)
+        {
+            err = rbd_aio_wait_for_complete(comp[i]);
+            if (err < 0)
+                return err;
+            rbd_aio_release(comp[i]);
+        }
+        data->read_batch = 0;
     }
     return 0;
 }
 
-void rbd_move(rbd_image_t src, rbd_image_t dst, uint64_t size)
+int move_extent(uint64_t offset, size_t len, int exists, void* data_ptr)
 {
-    struct rbd_move_data data = {
-        src,
-        dst,
-    };
-    rbd_read_iterate2(src, 0, size, move_extent, &data);
+    int err, i;
+    struct rbd_move_data* data = (struct rbd_move_data*)data_ptr;
+    if (exists)
+    {
+        if (data->read_batch >= MOVE_BY)
+        {
+            fprintf(stderr, "Extent count exceeded\n");
+            exit(1);
+        }
+        data->read_offset[data->read_batch] = offset;
+        data->read_len[data->read_batch] = len;
+        data->read_batch++;
+    }
+    return 0;
+}
+
+int rbd_move(rbd_image_t src, rbd_image_t dst, uint64_t size)
+{
+    int err;
+    uint64_t cur = 0;
+    struct rbd_move_data data = { 0 };
+    data.src = src;
+    data.dst = dst;
+    while (cur < size)
+    {
+        printf("\r%lld MB / %lld MB...", cur/1024/1024, size/1024/1024);
+        err = rbd_diff_iterate2(
+            src, NULL, cur, size-cur > MOVE_BY*4*1024*1024 ? MOVE_BY*4*1024*1024 : size-cur,
+            1, 1, move_extent, &data
+        );
+        if (err < 0)
+        {
+            return err;
+        }
+        move_extent_apply(&data);
+        cur += MOVE_BY*4*1024*1024;
+    }
+    printf(" Done\n");
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -46,6 +131,7 @@ int main(int argc, char **argv)
     rados_ioctx_t io;
     rbd_image_t src, dst;
     uint64_t size;
+    setvbuf(stdout, NULL, _IONBF, 0);
     err = rados_create(&cluster, NULL);
     if (err < 0)
     {
@@ -100,7 +186,12 @@ int main(int argc, char **argv)
                                 fprintf(stderr, "%s: cannot stat %s/%s: %s\n", argv[0], pool_name, src_img, strerror(-err));
                                 st = 1;
                             }
-                            rbd_move(src, dst, size);
+                            err = rbd_move(src, dst, size);
+                            if (err < 0)
+                            {
+                                fprintf(stderr, "%s: failed to move data: %s\n", argv[0], strerror(-err));
+                                st = 1;
+                            }
                             rbd_close(dst);
                         }
                         rbd_close(src);
