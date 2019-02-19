@@ -5,132 +5,114 @@
 #include "rados/librados.h"
 #include "rbd/librbd.h"
 
-// Move 8 objects at a time
-#define MOVE_BY 8
-
-struct rbd_move_data
-{
-    rbd_image_t src;
-    rbd_image_t dst;
-    int read_batch;
-    uint64_t read_offset[MOVE_BY];
-    size_t read_len[MOVE_BY];
-    void *buffers[MOVE_BY];
-    size_t buffer_size[MOVE_BY];
-};
-
-int move_extent_apply(struct rbd_move_data *data)
-{
-    if (data->read_batch > 0)
-    {
-        rbd_completion_t comp[MOVE_BY];
-        int i, err;
-        for (i = 0; i < data->read_batch; i++)
-        {
-            if (data->buffer_size[i] < data->read_len[i])
-            {
-                data->buffers[i] = realloc(data->buffers[i], data->read_len[i]);
-                data->buffer_size[i] = data->read_len[i];
-            }
-            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
-            if (err < 0)
-                return err;
-            err = rbd_aio_read(data->src, data->read_offset[i], data->read_len[i], data->buffers[i], comp[i]);
-            if (err < 0)
-                return err;
-        }
-        for (i = 0; i < data->read_batch; i++)
-        {
-            err = rbd_aio_wait_for_complete(comp[i]);
-            if (err < 0)
-                return err;
-            rbd_aio_release(comp[i]);
-            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
-            if (err < 0)
-                return err;
-            err = rbd_aio_write(data->dst, data->read_offset[i], data->read_len[i], data->buffers[i], comp[i]);
-            if (err < 0)
-                return err;
-        }
-        for (i = 0; i < data->read_batch; i++)
-        {
-            err = rbd_aio_wait_for_complete(comp[i]);
-            if (err < 0)
-                return err;
-            rbd_aio_release(comp[i]);
-            err = rbd_aio_create_completion(NULL, NULL, &comp[i]);
-            if (err < 0)
-                return err;
-            err = rbd_aio_discard(data->src, data->read_offset[i], data->read_len[i], comp[i]);
-            if (err < 0)
-                return err;
-        }
-        for (i = 0; i < data->read_batch; i++)
-        {
-            err = rbd_aio_wait_for_complete(comp[i]);
-            if (err < 0)
-                return err;
-            rbd_aio_release(comp[i]);
-        }
-        data->read_batch = 0;
-    }
-    return 0;
-}
-
-int move_extent(uint64_t offset, size_t len, int exists, void* data_ptr)
-{
-    int err, i;
-    struct rbd_move_data* data = (struct rbd_move_data*)data_ptr;
-    if (exists)
-    {
-        if (data->read_batch >= MOVE_BY)
-        {
-            fprintf(stderr, "Extent count exceeded\n");
-            exit(1);
-        }
-        data->read_offset[data->read_batch] = offset;
-        data->read_len[data->read_batch] = len;
-        data->read_batch++;
-    }
-    return 0;
-}
+#define MOVE_BUFFER 0x4000000
 
 int rbd_move(rbd_image_t src, rbd_image_t dst, uint64_t size)
 {
-    int err;
-    uint64_t cur = 0;
-    struct rbd_move_data data = { 0 };
-    data.src = src;
-    data.dst = dst;
+    int err = 0, i;
+    uint64_t cur = 0, len, prev_offset = 0, prev_len = 0;
+    rbd_completion_t read_comp = NULL, write_comp = NULL, discard_comp = NULL;
+    void *read_buffer = malloc(MOVE_BUFFER*2);
+    if (!read_buffer)
+    {
+        return 1;
+    }
+    void *curbuf = read_buffer;
     while (cur < size)
     {
         printf("\r%lld MB / %lld MB...", cur/1024/1024, size/1024/1024);
-        err = rbd_diff_iterate2(
-            src, NULL, cur, size-cur > MOVE_BY*4*1024*1024 ? MOVE_BY*4*1024*1024 : size-cur,
-            1, 1, move_extent, &data
-        );
+        rbd_completion_t comp;
+        err = rbd_aio_create_completion(NULL, NULL, &read_comp);
         if (err < 0)
+            goto ret;
+        len = size-cur > MOVE_BUFFER ? MOVE_BUFFER : size-cur;
+        err = rbd_aio_read(src, cur, len, curbuf, read_comp);
+        if (err < 0)
+            goto ret;
+        err = rbd_aio_wait_for_complete(read_comp);
+        if (err < 0)
+            goto ret;
+        rbd_aio_release(read_comp);
+        for (i = 0; i < MOVE_BUFFER/8; i++)
         {
-            return err;
+            if (((uint64_t*)curbuf)[i] != 0)
+            {
+                if (write_comp)
+                {
+                    err = rbd_aio_wait_for_complete(write_comp);
+                    if (err < 0)
+                        goto ret;
+                    rbd_aio_release(write_comp);
+                    if (discard_comp)
+                    {
+                        err = rbd_aio_wait_for_complete(discard_comp);
+                        if (err < 0)
+                            goto ret;
+                        rbd_aio_release(discard_comp);
+                    }
+                    err = rbd_aio_create_completion(NULL, NULL, &discard_comp);
+                    if (err < 0)
+                        goto ret;
+                    err = rbd_aio_discard(src, prev_offset, prev_len, discard_comp);
+                    if (err < 0)
+                        goto ret;
+                }
+                err = rbd_aio_create_completion(NULL, NULL, &write_comp);
+                if (err < 0)
+                    goto ret;
+                err = rbd_aio_write(dst, cur, len, curbuf, write_comp);
+                if (err < 0)
+                    goto ret;
+                curbuf = curbuf == read_buffer ? read_buffer+MOVE_BUFFER : read_buffer;
+                prev_offset = cur;
+                prev_len = len;
+                break;
+            }
         }
-        move_extent_apply(&data);
-        cur += MOVE_BY*4*1024*1024;
+        cur += MOVE_BUFFER;
+    }
+    if (write_comp)
+    {
+        err = rbd_aio_wait_for_complete(write_comp);
+        if (err < 0)
+            goto ret;
+        rbd_aio_release(write_comp);
+        write_comp = NULL;
+        if (discard_comp)
+        {
+            err = rbd_aio_wait_for_complete(discard_comp);
+            if (err < 0)
+                goto ret;
+            rbd_aio_release(discard_comp);
+            discard_comp = NULL;
+        }
+        err = rbd_discard(src, prev_offset, prev_len);
+        if (err < 0)
+            goto ret;
     }
     printf(" Done\n");
+ret:
+    free(read_buffer);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    char *pool_name = "rpool";
-    char *src_img = "one-1-49-1";
-    char *dst_img = "one-1-49-1-ec";
+    char *pool_name, *src_img, *dst_img;
     int err;
     int st;
     rados_t cluster;
     rados_ioctx_t io;
     rbd_image_t src, dst;
     uint64_t size;
+    if (argc < 4)
+    {
+        printf("USAGE: ./rbd-move POOL FROM TO\n");
+        return 1;
+    }
+    pool_name = argv[1];
+    src_img = argv[2];
+    dst_img = argv[3];
     setvbuf(stdout, NULL, _IONBF, 0);
     err = rados_create(&cluster, NULL);
     if (err < 0)
